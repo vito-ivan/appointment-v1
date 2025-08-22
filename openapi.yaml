@@ -1,0 +1,182 @@
+openapi: 3.0.3
+info:
+  title: API de Agendamiento de Citas
+  version: 1.0.0
+  description: |
+    Endpoint para solicitar una cita utilizando un identificador de espacio (scheduleId).
+    Un "espacio" corresponde a la combinación (centerId, specialtyId, medicId, dateTime).
+servers:
+  - url: https://api.ejemplo.com
+paths:
+  /appointments:
+    get:
+      summary: Listar citas por asegurado
+      operationId: listAppointmentsByInsured
+      parameters:
+        - in: query
+          name: insuredId
+          required: true
+          schema:
+            type: string
+            pattern: '^\d{5}$'
+          description: Código del asegurado (5 dígitos)
+      responses:
+        "200":
+          description: Listado de citas
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AppointmentCreated"
+        "400":
+          description: Parametros inválidos
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Crear (reservar) una cita
+      operationId: createAppointment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppointmentRequest"
+            examples:
+              ejemplo:
+                value:
+                  insuredId: "00742"
+                  scheduleId: 100
+                  countryISO: "PE"
+      responses:
+        "201":
+          description: Cita creada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppointmentCreated"
+              examples:
+                ejemplo:
+                  value:
+                    appointmentId: 912345
+                    schedule:
+                      scheduleId: 100
+                      centerId: 4
+                      specialtyId: 3
+                      medicId: 4
+                      dateTime: "2024-09-30T12:30:00Z"
+                    insuredId: "00742"
+        "400":
+          description: Error de validación
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                formatoInvalido:
+                  value:
+                    code: VALIDATION_ERROR
+                    message: insuredId no cumple el patrón ^\\d{5}$
+        "404":
+          description: scheduleId no encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                noEncontrado:
+                  value:
+                    code: SCHEDULE_NOT_FOUND
+                    message: scheduleId 100 no disponible
+        "409":
+          description: Conflicto (espacio ya reservado)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                conflicto:
+                  value:
+                    code: SCHEDULE_CONFLICT
+                    message: El espacio ya fue reservado
+        "500":
+          description: Error interno
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+components:
+  schemas:
+    AppointmentRequest:
+      type: object
+      required:
+        - insuredId
+        - scheduleId
+        - countryISO
+      properties:
+        insuredId:
+          type: string
+          description: Código del asegurado de 5 dígitos (puede incluir ceros a la izquierda).
+          pattern: '^\d{5}$'
+          example: "00742"
+        scheduleId:
+          type: integer
+          description: Identificador del espacio previamente publicado.
+          minimum: 1
+          example: 100
+        countryISO:
+          type: string
+          description: Código país permitido.
+          enum: [PE, CL]
+          example: PE
+    Schedule:
+      type: object
+      description: Detalle informativo del espacio.
+      properties:
+        scheduleId:
+          type: integer
+          example: 100
+        centerId:
+          type: integer
+          example: 4
+        specialtyId:
+          type: integer
+          example: 3
+        medicId:
+          type: integer
+          example: 4
+        dateTime:
+          type: string
+          format: date-time
+          example: "2024-09-30T12:30:00Z"
+    AppointmentCreated:
+      type: object
+      properties:
+        appointmentId:
+          type: string
+          description: Identificador único (UUID) de la cita creada.
+          example: "b3a9e6f2-5b2c-4f5a-b1a4-2f5e6b7c8d9e"
+        insuredId:
+          type: string
+          pattern: '^\d{5}$'
+          example: "00742"
+        status:
+          type: string
+          enum: [PENDING, COMPLETED]
+          example: PENDING
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          example: Parámetro inválido
