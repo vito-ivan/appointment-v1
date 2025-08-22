@@ -80,3 +80,26 @@ Notas
 
 - Los recursos (tabla DynamoDB, colas, tópico SNS, bus EventBridge, VPC, RDS y Proxy) se crean vía `serverless.yml`.
 - No se requieren endpoints locales (toda la configuración apunta a AWS por defecto).
+
+## Pruebas rápidas con curl
+
+> Después de desplegar, puedes probar la API usando los siguientes comandos:
+
+Crear cita
+
+```bash
+curl --location 'https://lxh1m7ssc7.execute-api.us-east-1.amazonaws.com/appointments' \
+--header 'Content-Type: application/json' \
+--data '{
+  "insuredId": "00743",
+  "scheduleId": 100,
+  "countryISO": "PE"
+}'
+```
+
+Consultar cita
+
+```bash
+curl --location 'https://rrn647fdt3.execute-api.us-east-1.amazonaws.com/appointments?insuredId=00743' \
+--header 'Content-Type: application/json'
+```
