@@ -1,0 +1,571 @@
+service: appointment-api
+frameworkVersion: "3"
+
+plugins:
+  - serverless-esbuild
+  - serverless-offline
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  memorySize: 512
+  timeout: 10
+  stage: dev
+  environment:
+    TABLE_NAME: ${self:service}-healthcare-${sls:stage}
+    NODE_OPTIONS: --enable-source-maps
+    DYNAMODB_ENDPOINT: ${env:DYNAMODB_ENDPOINT, ''}
+    STAGE: ${sls:stage}
+    SNS_TOPIC_ARN: { Ref: AppointmentEventsTopic }
+    EVENT_BUS_NAME: { Ref: AppEventBus }
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource:
+            - arn:aws:logs:${aws:region}:${aws:accountId}:log-group:/aws/lambda/*
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+            - dynamodb:ConditionCheckItem
+          Resource:
+            - arn:aws:dynamodb:${aws:region}:*:table/${self:provider.environment.TABLE_NAME}
+            - arn:aws:dynamodb:${aws:region}:*:table/${self:provider.environment.TABLE_NAME}/index/*
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource:
+            - { "Ref": "AppointmentEventsTopic" }
+        - Effect: Allow
+          Action:
+            - events:PutEvents
+          Resource:
+            - { "Fn::GetAtt": [AppEventBus, Arn] }
+        # Allow reading DB credentials from SSM Parameter Store / Secrets Manager in AWS
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - secretsmanager:GetSecretValue
+          Resource: "*"
+
+functions:
+  appointment:
+    handler: src/functions/appointment/interface/http/handler.handler
+    events:
+      - httpApi:
+          path: /appointments
+          method: post
+      - httpApi:
+          path: /appointments
+          method: get
+      - httpApi:
+          path: /docs/{proxy+}
+          method: get
+      - httpApi:
+          path: /openapi-json
+          method: get
+  appointmentPE:
+    handler: src/functions/appointment-pe/interface/sqs/handler.handler
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [QueuePE, Arn] }
+    environment:
+      # In AWS, resolve from the RDS instance created in this stack. Locally, override via env:MYSQL_HOST/MYSQL_PORT.
+      MYSQL_HOST: { Fn::GetAtt: [RdsProxy, Endpoint] }
+      MYSQL_PORT: "3306"
+      MYSQL_SECRET_ARN: { Ref: MySqlCredentials }
+      MYSQL_DATABASE: ${env:MYSQL_DATABASE, 'appointments'}
+      MYSQL_POOL_SIZE: ${env:MYSQL_POOL_SIZE, '2'}
+    vpc:
+      securityGroupIds:
+        - { Ref: LambdaSecurityGroup }
+      subnetIds:
+        - { Ref: SubnetPrivateA }
+        - { Ref: SubnetPrivateB }
+  appointmentCL:
+    handler: src/functions/appointment-cl/interface/sqs/handler.handler
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [QueueCL, Arn] }
+    environment:
+      MYSQL_HOST: { Fn::GetAtt: [RdsProxy, Endpoint] }
+      MYSQL_PORT: "3306"
+      MYSQL_SECRET_ARN: { Ref: MySqlCredentials }
+      MYSQL_DATABASE: ${env:MYSQL_DATABASE, 'appointments'}
+      MYSQL_POOL_SIZE: ${env:MYSQL_POOL_SIZE, '2'}
+    vpc:
+      securityGroupIds:
+        - { Ref: LambdaSecurityGroup }
+      subnetIds:
+        - { Ref: SubnetPrivateA }
+        - { Ref: SubnetPrivateB }
+  appointmentConfirmation:
+    handler: src/functions/appointment-confirmation/interface/sqs/handler.handler
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [QueueConfirmations, Arn] }
+          enabled: true
+
+resources:
+  Resources:
+    HealthcareTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.TABLE_NAME}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: GSI1
+            KeySchema:
+              - AttributeName: SK
+                KeyType: HASH
+              - AttributeName: PK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+    AppointmentEventsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${sls:stage}-appointment-events
+    # Country-based SQS queues
+    QueuePE:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-queue-pe
+    QueueCL:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-queue-cl
+
+    # SQS queue to receive confirmations from EventBridge
+    QueueConfirmations:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-confirmations
+    # Allow SNS Topic to send messages to each queue
+    QueuePEPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [{ Ref: QueuePE }]
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: "*"
+              Action: sqs:SendMessage
+              Resource: { Fn::GetAtt: [QueuePE, Arn] }
+              Condition:
+                ArnEquals: { aws:SourceArn: { Ref: AppointmentEventsTopic } }
+    QueueCLPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [{ Ref: QueueCL }]
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: "*"
+              Action: sqs:SendMessage
+              Resource: { Fn::GetAtt: [QueueCL, Arn] }
+              Condition:
+                ArnEquals: { aws:SourceArn: { Ref: AppointmentEventsTopic } }
+    # Subscriptions filtered by message body countryISO
+    SubPE:
+      Type: AWS::SNS::Subscription
+      Properties:
+        Protocol: sqs
+        TopicArn: { Ref: AppointmentEventsTopic }
+        Endpoint: { Fn::GetAtt: [QueuePE, Arn] }
+        RawMessageDelivery: true
+        FilterPolicyScope: MessageBody
+        FilterPolicy:
+          countryISO: ["PE"]
+    SubCL:
+      Type: AWS::SNS::Subscription
+      Properties:
+        Protocol: sqs
+        TopicArn: { Ref: AppointmentEventsTopic }
+        Endpoint: { Fn::GetAtt: [QueueCL, Arn] }
+        RawMessageDelivery: true
+        FilterPolicyScope: MessageBody
+        FilterPolicy:
+          countryISO: ["CL"]
+
+    # EventBridge bus and rule to route confirmations to SQS
+    AppEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:service}-${sls:stage}-bus
+
+    AppEventRuleConfirmations:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${sls:stage}-appointment-confirmations
+        EventBusName: { Ref: AppEventBus }
+        EventPattern:
+          source: ["appointment.consumer.pe"]
+          detail-type: ["AppointmentConfirmed"]
+        Targets:
+          - Id: SqsConfirmations
+            Arn: { Fn::GetAtt: [QueueConfirmations, Arn] }
+
+    AllowEventBridgeToSqsConfirmations:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [{ Ref: QueueConfirmations }]
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: { Fn::GetAtt: [QueueConfirmations, Arn] }
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    { Fn::GetAtt: [AppEventRuleConfirmations, Arn] }
+
+    # VPC Interface Endpoint for EventBridge (optional, for private subnets). Note: EventBridge uses public API
+    # but this can reduce egress/NAT needs in some setups (only available in some regions).
+    # Comment out if region doesn't support.
+    EventsEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName:
+          Fn::Sub: com.amazonaws.${AWS::Region}.events
+        VpcId: { Ref: VPC }
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        SubnetIds:
+          - { Ref: SubnetPrivateA }
+          - { Ref: SubnetPrivateB }
+        SecurityGroupIds:
+          - { Ref: VpcEndpointSecurityGroup }
+
+    # --- VPC + RDS MySQL provisioning (AWS) ---
+    VPC:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.0.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-vpc
+
+    # Internet access for public subnets
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+      Properties:
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-igw
+
+    VPCGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: { Ref: VPC }
+        InternetGatewayId: { Ref: InternetGateway }
+
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: { Ref: VPC }
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-public-rt
+
+    PublicDefaultRoute:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: { Ref: PublicRouteTable }
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: { Ref: InternetGateway }
+
+    SubnetPrivateA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: { Ref: VPC }
+        CidrBlock: 10.0.1.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 0
+            - Fn::GetAZs: { Ref: "AWS::Region" }
+        MapPublicIpOnLaunch: false
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-private-a
+
+    SubnetPrivateB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: { Ref: VPC }
+        CidrBlock: 10.0.2.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 1
+            - Fn::GetAZs: { Ref: "AWS::Region" }
+        MapPublicIpOnLaunch: false
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-private-b
+
+    # Public subnets for publicly accessible RDS
+    SubnetPublicA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: { Ref: VPC }
+        CidrBlock: 10.0.3.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 0
+            - Fn::GetAZs: { Ref: "AWS::Region" }
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-public-a
+
+    SubnetPublicB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: { Ref: VPC }
+        CidrBlock: 10.0.4.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 1
+            - Fn::GetAZs: { Ref: "AWS::Region" }
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-public-b
+
+    SubnetRouteTableAssociationPublicA:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: { Ref: SubnetPublicA }
+        RouteTableId: { Ref: PublicRouteTable }
+
+    SubnetRouteTableAssociationPublicB:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: { Ref: SubnetPublicB }
+        RouteTableId: { Ref: PublicRouteTable }
+    RdsDbSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: Subnet group for MySQL
+        SubnetIds:
+          - { Ref: SubnetPublicA }
+          - { Ref: SubnetPublicB }
+        DBSubnetGroupName: ${self:service}-${sls:stage}-mysql-subnets
+
+    RdsSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Allow RDS Proxy SG and optional CIDR to access MySQL 3306
+        VpcId: { Ref: VPC }
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 3306
+            ToPort: 3306
+            SourceSecurityGroupId: { Ref: RdsProxySecurityGroup }
+          - IpProtocol: tcp
+            FromPort: 3306
+            ToPort: 3306
+            CidrIp: ${self:custom.allowedMySQLCidr}
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-mysql-sg
+
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Security Group for Lambda functions
+        VpcId: { Ref: VPC }
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-lambda-sg
+
+    # Security group for VPC Interface Endpoints (allow HTTPS from Lambda SG)
+    VpcEndpointSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: SG for VPC Endpoints (Secrets Manager)
+        VpcId: { Ref: VPC }
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            SourceSecurityGroupId: { Ref: LambdaSecurityGroup }
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-vpce-sg
+
+    MySqlCredentials:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+        Name: ${self:service}-${sls:stage}-mysql-credentials
+        Description: Credentials for MySQL
+        SecretString: '{"username":"admin","password":"app123$2027"}'
+
+    MySqlInstance:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Engine: mysql
+        DBInstanceClass: db.t3.micro
+        AllocatedStorage: 20
+        PubliclyAccessible: true
+        VPCSecurityGroups:
+          - { Ref: RdsSecurityGroup }
+        DBSubnetGroupName: { Ref: RdsDbSubnetGroup }
+        DBName: appointments
+        MasterUsername:
+          Fn::Sub: "{{resolve:secretsmanager:${MySqlCredentials}:SecretString:username}}"
+        MasterUserPassword:
+          Fn::Sub: "{{resolve:secretsmanager:${MySqlCredentials}:SecretString:password}}"
+        BackupRetentionPeriod: 0
+        StorageEncrypted: false
+        MultiAZ: false
+        AutoMinorVersionUpgrade: true
+        DeletionProtection: false
+
+    # IAM role for RDS Proxy to read the DB credentials secret
+    RdsProxyRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: rds.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: AllowReadDbSecret
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: { Ref: MySqlCredentials }
+
+    # Security group for RDS Proxy (ingress from Lambda SG on 3306)
+    RdsProxySecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Security Group for RDS Proxy
+        VpcId: { Ref: VPC }
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 3306
+            ToPort: 3306
+            SourceSecurityGroupId: { Ref: LambdaSecurityGroup }
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-rds-proxy-sg
+
+    SecretsManagerEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName:
+          Fn::Sub: com.amazonaws.${AWS::Region}.secretsmanager
+        VpcId: { Ref: VPC }
+        VpcEndpointType: Interface
+        PrivateDnsEnabled: true
+        SubnetIds:
+          - { Ref: SubnetPrivateA }
+          - { Ref: SubnetPrivateB }
+        SecurityGroupIds:
+          - { Ref: VpcEndpointSecurityGroup }
+
+    # RDS Proxy targeting the MySQL instance
+    RdsProxy:
+      Type: AWS::RDS::DBProxy
+      Properties:
+        DBProxyName: ${self:service}-${sls:stage}-mysql-proxy
+        EngineFamily: MYSQL
+        Auth:
+          - AuthScheme: SECRETS
+            SecretArn: { Ref: MySqlCredentials }
+            IAMAuth: DISABLED
+        RequireTLS: true
+        DebugLogging: false
+        IdleClientTimeout: 1800
+        RoleArn: { Fn::GetAtt: [RdsProxyRole, Arn] }
+        VpcSecurityGroupIds:
+          - { Ref: RdsProxySecurityGroup }
+        VpcSubnetIds:
+          - { Ref: SubnetPrivateA }
+          - { Ref: SubnetPrivateB }
+
+    RdsProxyTargetGroup:
+      Type: AWS::RDS::DBProxyTargetGroup
+      Properties:
+        DBProxyName: { Ref: RdsProxy }
+        TargetGroupName: default
+        DBInstanceIdentifiers:
+          - { Ref: MySqlInstance }
+
+  Outputs:
+    MySqlEndpoint:
+      Description: RDS MySQL endpoint address
+      Value: { Fn::GetAtt: [MySqlInstance, Endpoint.Address] }
+      Export:
+        Name: ${self:service}-${sls:stage}-mysql-endpoint
+    RdsProxyEndpoint:
+      Description: RDS Proxy endpoint address
+      Value: { Fn::GetAtt: [RdsProxy, Endpoint] }
+      Export:
+        Name: ${self:service}-${sls:stage}-mysql-proxy-endpoint
+custom:
+  allowedMySQLCidr: ${env:ALLOWED_MYSQL_CIDR, '0.0.0.0/0'}
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: true
+    target: node18
+    platform: node
+    external:
+      [
+        aws-sdk,
+        "@nestjs/microservices",
+        "@nestjs/websockets",
+        "class-transformer/storage",
+        "@fastify/static",
+        "@fastify/view",
+      ]
+    define:
+      "process.env.NODE_ENV": '"production"'
+    exclude: []
+    keepOutputDirectory: false
